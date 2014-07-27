@@ -6,14 +6,19 @@ use warnings;
 use Data::Dumper qw/Dumper/;
 use POSIX qw/strftime/;
 use Time::HiRes qw//;
+use Net::Graphite;
+use Sys::Hostname qw//;
+use Getopt::Long;
 
 # use 5.20.0;
 
-sub log_message {
-    my $milliseconds = (split /[.]/ => Time::HiRes::time)[1];
-    my $now = strftime '%F %T', localtime;
-    my $message = sprintf "[%s.%05d] [%5s] %s\n", $now, $milliseconds, $$, $_[0];
-    # print STDERR $message;
+GetOptions(
+    'graphite_hostname=s' => \(my $graphite_host),
+    'local_hostname=s'    => \(my $local_hostname = Sys::Hostname::hostname),
+);
+
+unless ($graphite_host) {
+    die "usage: $0 --graphite_host=graphite.foo.com";
 }
 
 log_message('> retrieving netstat');
@@ -78,8 +83,9 @@ foreach my $df_line (@df_lines) {
     my %df_line;
     @df_line{@df_keys} = split /\s+/, $df_line;
     s/\A(\d+)\z/$1 * 1024/e foreach values %df_line;
-    next unless $df_line{device} =~ /dev/;
-    $df_info{ $df_line{mount} } = \%df_line;
+    next unless $df_line{device} =~ m|/dev/disk[01]s|;
+    $df_line{device} =~ s|/dev/||;
+    $df_info{ $df_line{device} } = \%df_line;
 }
 
 my %uptime_info;
@@ -101,6 +107,8 @@ foreach my $vmstat_line (@vmstat_lines) {
 }
 
 die Dumper({
+    local_hostname   => $local_hostname,
+    graphite_host    => $graphite_host,
     interfaces       => \%interfaces,
     battery_info     => \%battery_info,
     df_info          => \%df_info,
@@ -108,6 +116,18 @@ die Dumper({
     uptime_info      => \%uptime_info,
     vmstat_info      => \%vmstat_info,
 });
+
+my $graphite = Net::Graphite->new(
+    host  => $graphite_host,
+    trace => 1,
+);
+
+sub log_message {
+    my $milliseconds = (split /[.]/ => Time::HiRes::time)[1];
+    my $now = strftime '%F %T', localtime;
+    my $message = sprintf "[%s.%05d] [%5s] %s\n", $now, $milliseconds, $$, $_[0];
+    # print STDERR $message;
+}
 
 __DATA__
 
