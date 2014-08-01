@@ -9,38 +9,48 @@ use Time::HiRes qw//;
 use Net::Graphite;
 use Sys::Hostname qw//;
 use Getopt::Long;
+use DBI;
 
 # use 5.20.0;
 
 GetOptions(
     'graphite_hostname=s' => \(my $graphite_host),
     'local_hostname=s'    => \(my $local_hostname = Sys::Hostname::hostname),
+    'dry_run'             => \(my $dry_run),
 );
 
 unless ($graphite_host) {
     die "usage: $0 --graphite_host=graphite.foo.com";
 }
 
+my $dbh = DBI->connect("DBI:SQLite:$ENV{HOME}/.macmon.db");
+
 log_message('> retrieving netstat');
-my @netstat_lines     = qx{ netstat -b -i };
+my @netstat_lines = qx{ /usr/sbin/netstat -b -i };
 
 log_message('> retrieving ioreg');
-my @ioreg_lines       = grep {/CycleCount|Capacity|IsCharging/} qx{ ioreg -l };
+my @ioreg_lines = grep {/CycleCount|Capacity|IsCharging|ExternalConnected/} 
+                  qx{ /usr/sbin/ioreg -l };
 
 log_message('> retrieving tempmonitor');
-my @temperature_lines = qx{ /Applications/TemperatureMonitor.app/Contents/MacOS/tempmonitor -a -l };
+my @temperature_lines = -d "/Applications/TemperatureMonitor.app" ? qx{ /Applications/TemperatureMonitor.app/Contents/MacOS/tempmonitor -a -l } : ();
 
 log_message('> retrieving df');
-my @df_lines          = qx{ df -k -l };
+my @df_lines = qx{ /bin/df -k -l };
 
 log_message('> retrieving uptime');
-my @uptime_lines      = qx{ uptime };
+my @uptime_lines = qx{ /usr/bin/uptime };
 
 log_message('> retrieving vm_stat');
-my @vmstat_lines     = qx{ vm_stat -c1 1 };
+my @vmstat_lines = qx{ /usr/bin/vm_stat -c1 1 };
+
+log_message('> retrieving iostat');
+my @iostat_lines = qx{ /usr/sbin/iostat -C -n0 };
+
+################################################################################
+################################################################################
 
 my %interfaces = ( en0 => {}, en1 => {} );
-
 foreach my $netstat_line (@netstat_lines) {
     my @netstat = split /\s+/, $netstat_line;
 
@@ -65,6 +75,11 @@ foreach my $ioreg_line (@ioreg_lines) {
     my ($key, $value) = ($ioreg_line =~ m/\A [\s|]+ "(\w+)" [ ] = [ ] ["]?(\w+)["]? /xms);
     next unless $key && defined $value;
     $ioreg_info{$key} = $value;
+
+    if ( defined $ioreg_info{MaxCapacity} and defined $ioreg_info{CurrentCapacity} and defined $ioreg_info{DesignCapacity} ) {
+        $ioreg_info{PercentCapacity} = $ioreg_info{CurrentCapacity} / $ioreg_info{MaxCapacity};
+        $ioreg_info{DesignPercent} = $ioreg_info{CurrentCapacity} / $ioreg_info{DesignCapacity};
+    }
 }
 
 ################################################################################
@@ -81,6 +96,9 @@ foreach my $temperature_line (@temperature_lines) {
     $temperature_info{$device} = $temperature;
 }
 
+################################################################################
+################################################################################
+
 my %df_info;
 foreach my $df_line (@df_lines) {
     my @df_keys = qw/
@@ -89,13 +107,19 @@ foreach my $df_line (@df_lines) {
     my %df_line;
     @df_line{@df_keys} = split /\s+/, $df_line;
     s/\A(\d+)\z/$1 * 1024/e foreach values %df_line;
-    next unless $df_line{device} =~ m|/dev/disk[01]s|;
+    next unless $df_line{device} =~ m|/dev/disk[01]s?|;
     $df_line{device} =~ s|/dev/||;
     $df_info{ $df_line{device} } = \%df_line;
 }
 
-my %uptime_info;
-@uptime_info{qw/ 1m 5m 15m /} = (split /\s+/, $uptime_lines[0])[-3, -2, -1];
+################################################################################
+################################################################################
+
+# my %uptime_info;
+# @uptime_info{qw/ 1m 5m 15m /} = (split /\s+/, $uptime_lines[0])[-3, -2, -1];
+
+################################################################################
+################################################################################
 
 my %vmstat_info;
 foreach my $vmstat_line (@vmstat_lines) {
@@ -112,27 +136,150 @@ foreach my $vmstat_line (@vmstat_lines) {
     /};
 }
 
-die Dumper({
+################################################################################
+################################################################################
+
+my %iostat_info;
+foreach my $iostat_line (@iostat_lines) {
+    $iostat_line =~ s/\A\s+//;
+    next unless $iostat_line =~ m/\A\d/;
+
+    my @iostat_keys = qw/
+        user system idle 1m 5m 15m
+    /;
+
+    @iostat_info{@iostat_keys} = split /\s+/ => $iostat_line;
+}
+
+################################################################################
+################################################################################
+
+my %raw_data = (
     local_hostname   => $local_hostname,
     graphite_host    => $graphite_host,
     interfaces       => \%interfaces,
-    battery_info     => \%battery_info,
+    ioreg_info       => \%ioreg_info,
     df_info          => \%df_info,
     temperature_info => \%temperature_info,
-    uptime_info      => \%uptime_info,
+    # uptime_info      => \%uptime_info,
     vmstat_info      => \%vmstat_info,
-});
-
-my $graphite = Net::Graphite->new(
-    host  => $graphite_host,
-    trace => 1,
+    iostat_info      => \%iostat_info,
 );
+
+$dry_run and warn Dumper(\%raw_data);
+
+my ( %send_to_graphite, $graphite_text );
+
+$graphite_text = pack_graphite(\%raw_data, \%send_to_graphite);
+
+if ( $dry_run ) {
+    # warn Dumper({ graphite_text => $graphite_text });
+    die 'dry_run=1; not sending';
+}
+else {
+    my $graphite = Net::Graphite->new(
+        host  => $graphite_host,
+        # trace => 1,
+    );
+    $graphite->send(data => $graphite_text);
+}
+
+################################################################################
+################################################################################
 
 sub log_message {
     my $milliseconds = (split /[.]/ => Time::HiRes::time)[1];
     my $now = strftime '%F %T', localtime;
     my $message = sprintf "[%s.%05d] [%5s] %s\n", $now, $milliseconds, $$, $_[0];
     # print STDERR $message;
+}
+
+sub pack_graphite {
+    my ($raw_data, $send_to_graphite) = @_;
+
+    my $local_hostname = $raw_data->{local_hostname};
+
+    my $get_network_diff_via_dbh = sub {
+        my ($interface_key, $byte_value) = @_;
+
+        # warn "$interface_key, $byte_value";
+
+        my $bytes_diff = 0;
+
+        if ( $byte_value ) {
+            my $previous_byte_value = $dbh->selectrow_array("SELECT macmon_value FROM macmon WHERE macmon_key = ?", {}, $interface_key);
+            $bytes_diff = $byte_value - $previous_byte_value;
+            $dbh->do("UPDATE macmon SET macmon_value = ? where macmon_key = ?", {}, $byte_value, $interface_key);
+        }
+
+        $interface_key =~ s/interfaces/network/;
+        $interface_key =~ s/bytes_out/tx_bytes/;
+        $interface_key =~ s/bytes_in/rx_bytes/;
+
+        return ( $interface_key, $bytes_diff );
+    };
+
+    my $mangle_ioreg_battery_info = sub {
+        my ($k, $v) = @_;
+        $k =~ s/ioreg_info/battery/;
+        $v = lc($v) eq 'yes' ? 1 : 0;
+        return $k, $v;
+    };
+
+    my %transform = (
+        'vmstat_info.free'              => 'memory.MemFree',
+        'vmstat_info.active'            => 'memory.Active',
+        'vmstat_info.inactive'          => 'memory.Inactive',
+        'iostat_info.1m'                => 'loadavg.01',
+        'iostat_info.5m'                => 'loadavg.05',
+        'iostat_info.15m'               => 'loadavg.15',
+        'iostat_info.user'              => 'cpu.total.user',
+        'iostat_info.system'            => 'cpu.total.system',
+        'iostat_info.idle'              => 'cpu.total.idle',
+        'ioreg_info.DesignCapacity'     => 'battery.DesignCapacity',
+        'ioreg_info.MaxCapacity'        => 'battery.MaxCapacity',
+        'ioreg_info.CurrentCapacity'    => 'battery.CurrentCapacity',
+        'ioreg_info.PercentCapacity'    => 'battery.PercentCapacity',
+        'ioreg_info.DesignPercent'      => 'battery.DesignPercent',
+        'ioreg_info.CycleCount'         => 'battery.CycleCount',
+        'ioreg_info.IsCharging'         => $mangle_ioreg_battery_info,
+        'ioreg_info.ExternalConnected'  => $mangle_ioreg_battery_info,
+        'df_info.disk1.used'            => 'diskspace.root.byte_used',
+        'df_info.disk1.available'       => 'diskspace.root.byte_free',
+        'interfaces.en0.bytes_in'       => $get_network_diff_via_dbh,
+        'interfaces.en0.bytes_out'      => $get_network_diff_via_dbh,
+        'interfaces.en1.bytes_in'       => $get_network_diff_via_dbh,
+        'interfaces.en1.bytes_out'      => $get_network_diff_via_dbh,
+    );
+
+    SOURCE:
+    while (my ($source_key, $destination_key) = each %transform) {
+        my ($level1, $level2, $level3) = split /[.]/ => $source_key;
+
+        my $value;
+
+        if ( $level1 and $level2 and !$level3 ) {
+            $value = $raw_data{$level1}{$level2};
+        }
+        elsif ( $level1 and $level2 and $level3 ) {
+            $value = $raw_data{$level1}{$level2}{$level3};
+        }
+
+        if ( ref($destination_key) eq 'CODE' ) {
+            # warn "executing $source_key CODEREF";
+            ($destination_key, $value) = $destination_key->($source_key, $value);
+            next SOURCE unless ( $destination_key and defined $value );
+        }
+
+        my $qualified_destination = sprintf 'servers.%s.%s', $local_hostname, $destination_key;
+
+        $dry_run and warn "$source_key( value: $value ) => servers.$local_hostname.$destination_key";
+
+        $send_to_graphite->{$qualified_destination} = $value;
+    }
+
+    my $now = time;
+    return join "\n" => map { sprintf "%s %s %s", $_, $send_to_graphite->{$_}, $now } keys %$send_to_graphite;
 }
 
 __DATA__
