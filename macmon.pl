@@ -25,7 +25,7 @@ log_message('> retrieving netstat');
 my @netstat_lines     = qx{ netstat -b -i };
 
 log_message('> retrieving ioreg');
-my @ioreg_lines       = grep {/CycleCount|Capacity/} qx{ ioreg -l };
+my @ioreg_lines       = grep {/CycleCount|Capacity|IsCharging/} qx{ ioreg -l };
 
 log_message('> retrieving tempmonitor');
 my @temperature_lines = qx{ /Applications/TemperatureMonitor.app/Contents/MacOS/tempmonitor -a -l };
@@ -57,12 +57,18 @@ foreach my $netstat_line (@netstat_lines) {
     $interface_data->{bytes_out} = $netstat_line{bytes_out};
 }
 
-my %battery_info;
+################################################################################
+################################################################################
+
+my %ioreg_info;
 foreach my $ioreg_line (@ioreg_lines) {
-    my ($key, $value) = ($ioreg_line =~ m/\A [\s|]+ "(\w+)" [ ] = [ ] (\d+) /xms);
+    my ($key, $value) = ($ioreg_line =~ m/\A [\s|]+ "(\w+)" [ ] = [ ] ["]?(\w+)["]? /xms);
     next unless $key && defined $value;
-    $battery_info{$key} = $value;
+    $ioreg_info{$key} = $value;
 }
+
+################################################################################
+################################################################################
 
 my %temperature_info;
 foreach my $temperature_line (@temperature_lines) {
