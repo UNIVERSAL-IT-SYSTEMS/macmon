@@ -50,7 +50,7 @@ my @iostat_lines = qx{ /usr/sbin/iostat -C -n0 };
 ################################################################################
 ################################################################################
 
-my %interfaces = ( en0 => {}, en1 => {} );
+my %interfaces = ( en0 => {}, en1 => {}, en4 => {} );
 foreach my $netstat_line (@netstat_lines) {
     my @netstat = split /\s+/, $netstat_line;
 
@@ -250,6 +250,8 @@ sub pack_graphite {
         'interfaces.en0.bytes_out'      => $get_network_diff_via_dbh,
         'interfaces.en1.bytes_in'       => $get_network_diff_via_dbh,
         'interfaces.en1.bytes_out'      => $get_network_diff_via_dbh,
+        'interfaces.en4.bytes_in'       => $get_network_diff_via_dbh,
+        'interfaces.en4.bytes_out'      => $get_network_diff_via_dbh,
     );
 
     SOURCE:
