@@ -208,7 +208,8 @@ sub pack_graphite {
 
         if ( $byte_value ) {
             my $previous_byte_value = $dbh->selectrow_array("SELECT macmon_value FROM macmon WHERE macmon_key = ?", {}, $interface_key);
-            $bytes_diff = $byte_value - $previous_byte_value;
+            $bytes_diff = ($previous_byte_value <= $byte_value) ? ($byte_value - $previous_byte_value) : 0;
+            # warn "interface_key: $interface_key, byte_value: $byte_value, previous_byte_value: $previous_byte_value, bytes_diff: $bytes_diff";
             $dbh->do("UPDATE macmon SET macmon_value = ? where macmon_key = ?", {}, $byte_value, $interface_key);
         }
 
